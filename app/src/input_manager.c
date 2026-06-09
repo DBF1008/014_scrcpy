@@ -1,6 +1,7 @@
 #include "input_manager.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <SDL3/SDL.h>
@@ -13,6 +14,8 @@
 #include "shortcut_mod.h"
 #include "util/log.h"
 #include "util/sdl.h"
+
+#define SC_WHEEL_GESTURE_TIMEOUT_MS 300
 
 void
 sc_input_manager_init(struct sc_input_manager *im,
@@ -39,6 +42,10 @@ sc_input_manager_init(struct sc_input_manager *im,
     im->vfinger_down = false;
     im->vfinger_invert_x = false;
     im->vfinger_invert_y = false;
+
+    im->wheel_gesture.type = SC_WHEEL_GESTURE_NONE;
+    im->wheel_gesture.timer_id = 0;
+    im->wheel_gesture.generation = 0;
 
     im->mouse_buttons_state = 0;
 
@@ -409,6 +416,192 @@ inverse_point(struct sc_point point, struct sc_size size,
     }
     return point;
 }
+
+// ---- Wheel-driven two-finger gesture simulation (pinch/rotate) ----
+
+static void
+sc_wheel_gesture_send_touch(struct sc_input_manager *im,
+                            uint64_t pointer_id,
+                            enum android_motionevent_action action,
+                            struct sc_point point) {
+    bool up = action == AMOTION_EVENT_ACTION_UP
+           || action == AMOTION_EVENT_ACTION_POINTER_UP;
+
+    struct sc_control_msg msg;
+    msg.type = SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT;
+    msg.inject_touch_event.action = action;
+    msg.inject_touch_event.position.screen_size = im->screen->frame_size;
+    msg.inject_touch_event.position.point = point;
+    msg.inject_touch_event.pointer_id = pointer_id;
+    msg.inject_touch_event.pressure = up ? 0.0f : 1.0f;
+    msg.inject_touch_event.action_button = 0;
+    msg.inject_touch_event.buttons = 0;
+
+    if (!sc_controller_push_msg(im->controller, &msg)) {
+        LOGW("Could not request 'inject wheel gesture touch event'");
+    }
+}
+
+static void
+sc_wheel_gesture_compute_fingers(struct sc_input_manager *im,
+                                 struct sc_point *f1,
+                                 struct sc_point *f2) {
+    struct sc_wheel_gesture_state *gs = &im->wheel_gesture;
+    struct sc_size frame = im->screen->frame_size;
+
+    if (gs->type == SC_WHEEL_GESTURE_PINCH) {
+        int32_t half = (int32_t) gs->value;
+        f1->x = gs->center.x;
+        f1->y = gs->center.y - half;
+        f2->x = gs->center.x;
+        f2->y = gs->center.y + half;
+    } else {
+        // SC_WHEEL_GESTURE_ROTATE
+        uint16_t min_dim = MIN(frame.width, frame.height);
+        float radius = min_dim / 4.0f;
+        float angle = gs->value;
+        f1->x = gs->center.x + (int32_t)(radius * cosf(angle));
+        f1->y = gs->center.y - (int32_t)(radius * sinf(angle));
+        f2->x = gs->center.x - (int32_t)(radius * cosf(angle));
+        f2->y = gs->center.y + (int32_t)(radius * sinf(angle));
+    }
+
+    // Clamp to screen bounds
+    f1->x = CLAMP(f1->x, 0, (int32_t) frame.width - 1);
+    f1->y = CLAMP(f1->y, 0, (int32_t) frame.height - 1);
+    f2->x = CLAMP(f2->x, 0, (int32_t) frame.width - 1);
+    f2->y = CLAMP(f2->y, 0, (int32_t) frame.height - 1);
+}
+
+static void
+sc_wheel_gesture_apply_delta(struct sc_input_manager *im, float scroll_y) {
+    struct sc_wheel_gesture_state *gs = &im->wheel_gesture;
+    struct sc_size frame = im->screen->frame_size;
+    uint16_t min_dim = MIN(frame.width, frame.height);
+
+    if (gs->type == SC_WHEEL_GESTURE_PINCH) {
+        float step = min_dim / 20.0f;
+        gs->value += scroll_y * step;
+        float max_dist = min_dim / 2.0f - 10.0f;
+        gs->value = CLAMP(gs->value, 10.0f, max_dist);
+    } else {
+        // SC_WHEEL_GESTURE_ROTATE
+        float angle_step = (float) M_PI / 8.0f;
+        gs->value += scroll_y * angle_step;
+    }
+}
+
+static void
+sc_wheel_gesture_finish(struct sc_input_manager *im) {
+    struct sc_wheel_gesture_state *gs = &im->wheel_gesture;
+    if (gs->type == SC_WHEEL_GESTURE_NONE) {
+        return; // already idle, idempotent
+    }
+
+    struct sc_point f1, f2;
+    sc_wheel_gesture_compute_fingers(im, &f1, &f2);
+
+    // Release the second finger first (POINTER_UP), then the first (UP)
+    sc_wheel_gesture_send_touch(im, SC_POINTER_ID_WHEEL_FINGER_2,
+                                AMOTION_EVENT_ACTION_POINTER_UP, f2);
+    sc_wheel_gesture_send_touch(im, SC_POINTER_ID_WHEEL_FINGER_1,
+                                AMOTION_EVENT_ACTION_UP, f1);
+
+    if (gs->timer_id) {
+        SDL_RemoveTimer(gs->timer_id);
+        gs->timer_id = 0;
+    }
+
+    gs->type = SC_WHEEL_GESTURE_NONE;
+}
+
+static Uint32
+sc_wheel_gesture_timer_callback(void *userdata, SDL_TimerID timer_id,
+                                Uint32 interval) {
+    (void) timer_id;
+    (void) interval;
+
+    uint32_t generation = (uint32_t)(uintptr_t) userdata;
+
+    SDL_Event event;
+    SDL_zero(event);
+    event.type = SC_EVENT_WHEEL_GESTURE_TIMEOUT;
+    event.user.data1 = (void *)(uintptr_t) generation;
+    SDL_PushEvent(&event);
+
+    return 0; // one-shot, do not repeat
+}
+
+static void
+sc_wheel_gesture_reset_timer(struct sc_input_manager *im) {
+    struct sc_wheel_gesture_state *gs = &im->wheel_gesture;
+
+    if (gs->timer_id) {
+        SDL_RemoveTimer(gs->timer_id);
+        gs->timer_id = 0;
+    }
+
+    gs->generation++;
+
+    gs->timer_id = SDL_AddTimer(SC_WHEEL_GESTURE_TIMEOUT_MS,
+                                sc_wheel_gesture_timer_callback,
+                                (void *)(uintptr_t) gs->generation);
+    if (!gs->timer_id) {
+        LOGW("Could not start wheel gesture timer");
+        sc_wheel_gesture_finish(im);
+    }
+}
+
+static void
+sc_wheel_gesture_start(struct sc_input_manager *im,
+                       enum sc_wheel_gesture_type type,
+                       struct sc_point center,
+                       float scroll_y) {
+    struct sc_wheel_gesture_state *gs = &im->wheel_gesture;
+    gs->type = type;
+    gs->center = center;
+
+    struct sc_size frame = im->screen->frame_size;
+    uint16_t min_dim = MIN(frame.width, frame.height);
+
+    if (type == SC_WHEEL_GESTURE_PINCH) {
+        gs->value = min_dim / 4.0f;
+    } else {
+        gs->value = (float) M_PI / 2.0f;
+    }
+
+    // Send initial DOWN events for both fingers
+    struct sc_point f1, f2;
+    sc_wheel_gesture_compute_fingers(im, &f1, &f2);
+
+    sc_wheel_gesture_send_touch(im, SC_POINTER_ID_WHEEL_FINGER_1,
+                                AMOTION_EVENT_ACTION_DOWN, f1);
+    sc_wheel_gesture_send_touch(im, SC_POINTER_ID_WHEEL_FINGER_2,
+                                AMOTION_EVENT_ACTION_POINTER_DOWN, f2);
+
+    // Apply the first scroll delta and send MOVE
+    sc_wheel_gesture_apply_delta(im, scroll_y);
+
+    sc_wheel_gesture_compute_fingers(im, &f1, &f2);
+    sc_wheel_gesture_send_touch(im, SC_POINTER_ID_WHEEL_FINGER_1,
+                                AMOTION_EVENT_ACTION_MOVE, f1);
+    sc_wheel_gesture_send_touch(im, SC_POINTER_ID_WHEEL_FINGER_2,
+                                AMOTION_EVENT_ACTION_MOVE, f2);
+}
+
+static void
+sc_wheel_gesture_update(struct sc_input_manager *im, float scroll_y) {
+    sc_wheel_gesture_apply_delta(im, scroll_y);
+
+    struct sc_point f1, f2;
+    sc_wheel_gesture_compute_fingers(im, &f1, &f2);
+    sc_wheel_gesture_send_touch(im, SC_POINTER_ID_WHEEL_FINGER_1,
+                                AMOTION_EVENT_ACTION_MOVE, f1);
+    sc_wheel_gesture_send_touch(im, SC_POINTER_ID_WHEEL_FINGER_2,
+                                AMOTION_EVENT_ACTION_MOVE, f2);
+}
+
+// ---- End wheel gesture simulation ----
 
 static void
 sc_input_manager_process_key(struct sc_input_manager *im,
@@ -939,6 +1132,7 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
     }
 
     bool change_vfinger = event->button == SDL_BUTTON_LEFT &&
+            im->wheel_gesture.type == SC_WHEEL_GESTURE_NONE &&
             ((down && !im->vfinger_down && (ctrl_pressed || shift_pressed)) ||
              (!down && im->vfinger_down));
     bool use_finger = im->vfinger_down || change_vfinger;
@@ -1013,6 +1207,60 @@ sc_input_manager_process_mouse_wheel(struct sc_input_manager *im,
                                      const SDL_MouseWheelEvent *event) {
     if (im->camera || !im->kp || im->screen->paused || im->disconnected) {
         return;
+    }
+
+    SDL_Keymod keymod = SDL_GetModState();
+    bool ctrl_pressed = keymod & SDL_KMOD_CTRL;
+    bool shift_pressed = keymod & SDL_KMOD_SHIFT;
+
+    // Determine if this should be a two-finger gesture
+    enum sc_wheel_gesture_type gesture_type = SC_WHEEL_GESTURE_NONE;
+    if (ctrl_pressed) {
+        gesture_type = SC_WHEEL_GESTURE_PINCH;
+    } else if (shift_pressed) {
+        gesture_type = SC_WHEEL_GESTURE_ROTATE;
+    }
+
+    if (gesture_type != SC_WHEEL_GESTURE_NONE) {
+        // Two-finger gesture mode
+        if (!im->controller) {
+            return;
+        }
+
+        if (im->vfinger_down) {
+            // vfinger drag in progress, do not interfere
+            return;
+        }
+
+        if (im->mp && im->mp->relative_mode) {
+            return;
+        }
+
+        float mouse_x, mouse_y;
+        SDL_GetMouseState(&mouse_x, &mouse_y);
+        struct sc_point mouse =
+            sc_screen_convert_window_to_frame_coords(im->screen,
+                                                     mouse_x, mouse_y);
+
+        // If a different gesture type is active, finish it first
+        if (im->wheel_gesture.type != SC_WHEEL_GESTURE_NONE
+                && im->wheel_gesture.type != gesture_type) {
+            sc_wheel_gesture_finish(im);
+        }
+
+        if (im->wheel_gesture.type == SC_WHEEL_GESTURE_NONE) {
+            sc_wheel_gesture_start(im, gesture_type, mouse, event->y);
+        } else {
+            sc_wheel_gesture_update(im, event->y);
+        }
+
+        sc_wheel_gesture_reset_timer(im);
+        return;
+    }
+
+    // No modifier key -- finish any active gesture, then do normal scroll
+    if (im->wheel_gesture.type != SC_WHEEL_GESTURE_NONE) {
+        sc_wheel_gesture_finish(im);
     }
 
     if (!im->mp->ops->process_mouse_scroll) {
@@ -1159,6 +1407,10 @@ static void
 sc_input_manager_on_device_disconnected(struct sc_input_manager *im) {
     im->disconnected = true;
 
+    if (im->wheel_gesture.type != SC_WHEEL_GESTURE_NONE) {
+        sc_wheel_gesture_finish(im);
+    }
+
     struct sc_fps_counter *fps_counter = &im->screen->fps_counter;
     if (sc_fps_counter_is_started(fps_counter)) {
         sc_fps_counter_stop(fps_counter);
@@ -1208,5 +1460,12 @@ sc_input_manager_handle_event(struct sc_input_manager *im,
         case SC_EVENT_DEVICE_DISCONNECTED:
             sc_input_manager_on_device_disconnected(im);
             break;
+        case SC_EVENT_WHEEL_GESTURE_TIMEOUT: {
+            uint32_t gen = (uint32_t)(uintptr_t) event->user.data1;
+            if (gen == im->wheel_gesture.generation) {
+                sc_wheel_gesture_finish(im);
+            }
+            break;
+        }
     }
 }

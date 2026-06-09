@@ -59,6 +59,10 @@ get_well_known_pointer_id_name(uint64_t pointer_id) {
             return "finger";
         case SC_POINTER_ID_VIRTUAL_FINGER:
             return "vfinger";
+        case SC_POINTER_ID_WHEEL_FINGER_1:
+            return "wfinger1";
+        case SC_POINTER_ID_WHEEL_FINGER_2:
+            return "wfinger2";
         default:
             return NULL;
     }

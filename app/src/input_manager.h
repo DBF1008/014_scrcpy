@@ -7,6 +7,9 @@
 #include <stdint.h>
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_keycode.h>
+#include <SDL3/SDL_timer.h>
+
+#include "coords.h"
 
 #include "controller.h"
 #include "file_pusher.h"
@@ -14,6 +17,20 @@
 #include "trait/gamepad_processor.h"
 #include "trait/key_processor.h"
 #include "trait/mouse_processor.h"
+
+enum sc_wheel_gesture_type {
+    SC_WHEEL_GESTURE_NONE,
+    SC_WHEEL_GESTURE_PINCH,
+    SC_WHEEL_GESTURE_ROTATE,
+};
+
+struct sc_wheel_gesture_state {
+    enum sc_wheel_gesture_type type;
+    struct sc_point center;      // gesture center (frame coordinates)
+    float value;                 // pinch: half-distance (px), rotate: angle (rad)
+    SDL_TimerID timer_id;
+    uint32_t generation;         // to ignore stale timeout events
+};
 
 struct sc_input_manager {
     struct sc_controller *controller;
@@ -35,6 +52,8 @@ struct sc_input_manager {
     bool vfinger_down;
     bool vfinger_invert_x;
     bool vfinger_invert_y;
+
+    struct sc_wheel_gesture_state wheel_gesture;
 
     uint8_t mouse_buttons_state; // OR of enum sc_mouse_button values
 
