@@ -543,6 +543,8 @@ scrcpy(struct scrcpy_options *options) {
         if (!sc_recorder_init(&s->recorder, options->record_filename,
                               options->record_format, options->video,
                               options->audio, options->record_orientation,
+                              options->record_split_time,
+                              options->record_split_size,
                               &recorder_cbs, NULL)) {
             goto end;
         }

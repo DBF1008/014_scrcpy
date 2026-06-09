@@ -37,6 +37,50 @@ find_muxer(const char *name) {
     return oformat;
 }
 
+static char *
+sc_recorder_gen_segment_filename(const char *tmpl, unsigned index) {
+    // Find the extension in the filename part (not directory)
+    const char *basename = strrchr(tmpl, '/');
+#ifdef _WIN32
+    const char *basename_bs = strrchr(tmpl, '\\');
+    if (!basename || (basename_bs && basename_bs > basename)) {
+        basename = basename_bs;
+    }
+#endif
+    if (basename) {
+        basename++;
+    } else {
+        basename = tmpl;
+    }
+
+    const char *dot = strrchr(basename, '.');
+    size_t base_len;
+    const char *ext;
+    if (dot) {
+        base_len = dot - tmpl;
+        ext = dot; // includes the dot
+    } else {
+        base_len = strlen(tmpl);
+        ext = "";
+    }
+
+    size_t ext_len = strlen(ext);
+    size_t buf_size = base_len + 16 + ext_len + 1;
+    char *result = malloc(buf_size);
+    if (!result) {
+        LOG_OOM();
+        return NULL;
+    }
+
+    snprintf(result, buf_size, "%.*s-%03u%s", (int) base_len, tmpl, index, ext);
+    return result;
+}
+
+static inline bool
+sc_recorder_splitting_enabled(struct sc_recorder *recorder) {
+    return recorder->split_time > 0 || recorder->split_size > 0;
+}
+
 static AVPacket *
 sc_recorder_packet_ref(const AVPacket *packet) {
     AVPacket *p = av_packet_alloc();
@@ -179,6 +223,81 @@ sc_recorder_close_output_file(struct sc_recorder *recorder) {
     avformat_free_context(recorder->ctx);
 }
 
+static bool
+sc_recorder_set_orientation(AVStream *stream, enum sc_orientation orientation);
+
+static bool
+sc_recorder_should_split(struct sc_recorder *recorder, int64_t segment_pts) {
+    if (recorder->split_time > 0 && segment_pts >= recorder->split_time) {
+        return true;
+    }
+    if (recorder->split_size > 0) {
+        int64_t size = avio_tell(recorder->ctx->pb);
+        if (size >= 0 && (size_t) size >= recorder->split_size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool
+sc_recorder_start_new_segment(struct sc_recorder *recorder) {
+    free(recorder->filename);
+    recorder->segment_index++;
+    recorder->filename = sc_recorder_gen_segment_filename(
+        recorder->filename_template, recorder->segment_index);
+    if (!recorder->filename) {
+        return false;
+    }
+
+    if (!sc_recorder_open_output_file(recorder)) {
+        return false;
+    }
+
+    if (recorder->video) {
+        AVStream *stream = avformat_new_stream(recorder->ctx, NULL);
+        if (!stream) {
+            goto error_close;
+        }
+        if (avcodec_parameters_copy(stream->codecpar,
+                                    recorder->video_codecpar) < 0) {
+            goto error_close;
+        }
+        recorder->video_stream.index = stream->index;
+        recorder->video_stream.last_pts = AV_NOPTS_VALUE;
+
+        if (recorder->orientation != SC_ORIENTATION_0) {
+            if (!sc_recorder_set_orientation(stream, recorder->orientation)) {
+                goto error_close;
+            }
+        }
+    }
+
+    if (recorder->audio) {
+        AVStream *stream = avformat_new_stream(recorder->ctx, NULL);
+        if (!stream) {
+            goto error_close;
+        }
+        if (avcodec_parameters_copy(stream->codecpar,
+                                    recorder->audio_codecpar) < 0) {
+            goto error_close;
+        }
+        recorder->audio_stream.index = stream->index;
+        recorder->audio_stream.last_pts = AV_NOPTS_VALUE;
+    }
+
+    if (avformat_write_header(recorder->ctx, NULL) < 0) {
+        LOGE("Failed to write header to %s", recorder->filename);
+        goto error_close;
+    }
+
+    return true;
+
+error_close:
+    sc_recorder_close_output_file(recorder);
+    return false;
+}
+
 static inline bool
 sc_recorder_must_wait_for_config_packets(struct sc_recorder *recorder) {
     if (recorder->video && sc_vecdeque_is_empty(&recorder->video_queue)) {
@@ -267,6 +386,36 @@ sc_recorder_process_header(struct sc_recorder *recorder) {
     if (!ok) {
         LOGE("Failed to write header to %s", recorder->filename);
         goto end;
+    }
+
+    // Save codec parameters for potential segment splitting
+    if (sc_recorder_splitting_enabled(recorder)) {
+        if (recorder->video) {
+            AVStream *vs =
+                recorder->ctx->streams[recorder->video_stream.index];
+            recorder->video_codecpar = avcodec_parameters_alloc();
+            if (!recorder->video_codecpar) {
+                LOG_OOM();
+                goto end;
+            }
+            if (avcodec_parameters_copy(recorder->video_codecpar,
+                                        vs->codecpar) < 0) {
+                goto end;
+            }
+        }
+        if (recorder->audio) {
+            AVStream *as =
+                recorder->ctx->streams[recorder->audio_stream.index];
+            recorder->audio_codecpar = avcodec_parameters_alloc();
+            if (!recorder->audio_codecpar) {
+                LOG_OOM();
+                goto end;
+            }
+            if (avcodec_parameters_copy(recorder->audio_codecpar,
+                                        as->codecpar) < 0) {
+                goto end;
+            }
+        }
     }
 
     ret = true;
@@ -392,6 +541,67 @@ sc_recorder_process_packets(struct sc_recorder *recorder) {
             video_pkt->pts -= pts_origin;
             video_pkt->dts = video_pkt->pts;
 
+            // Check for segment split at keyframes
+            if (sc_recorder_splitting_enabled(recorder)
+                    && (video_pkt->flags & AV_PKT_FLAG_KEY)
+                    && video_pkt_previous
+                    && sc_recorder_should_split(recorder, video_pkt->pts)) {
+
+                // Flush pending audio to current segment before splitting
+                if (audio_pkt) {
+                    audio_pkt->pts -= pts_origin;
+                    audio_pkt->dts = audio_pkt->pts;
+
+                    bool ok = sc_recorder_write_audio(recorder, audio_pkt);
+                    av_packet_free(&audio_pkt);
+                    audio_pkt = NULL;
+                    if (!ok) {
+                        LOGE("Could not record audio packet");
+                        error = true;
+                        goto end;
+                    }
+                }
+
+                // Write previous video packet to current segment
+                video_pkt_previous->duration = video_pkt->pts
+                                             - video_pkt_previous->pts;
+
+                bool ok = sc_recorder_write_video(recorder,
+                                                  video_pkt_previous);
+                av_packet_free(&video_pkt_previous);
+                video_pkt_previous = NULL;
+                if (!ok) {
+                    LOGE("Could not record video packet");
+                    error = true;
+                    goto end;
+                }
+
+                // Finalize current segment
+                int ret = av_write_trailer(recorder->ctx);
+                if (ret < 0) {
+                    LOGE("Failed to write trailer to %s",
+                         recorder->filename);
+                    error = true;
+                    goto end;
+                }
+                sc_recorder_close_output_file(recorder);
+
+                LOGI("Recording segment complete: %s",
+                     recorder->filename);
+
+                // Update pts_origin so new segment starts from 0
+                pts_origin += video_pkt->pts;
+                video_pkt->pts = 0;
+                video_pkt->dts = 0;
+
+                // Start new segment
+                ok = sc_recorder_start_new_segment(recorder);
+                if (!ok) {
+                    error = true;
+                    goto end;
+                }
+            }
+
             if (video_pkt_previous) {
                 // we now know the duration of the previous packet
                 video_pkt_previous->duration = video_pkt->pts
@@ -490,8 +700,13 @@ run_recorder(void *data) {
 
     if (success) {
         const char *format_name = sc_recorder_get_format_name(recorder->format);
-        LOGI("Recording complete to %s file: %s", format_name,
-                                                  recorder->filename);
+        if (recorder->filename_template) {
+            LOGI("Recording complete: %u %s segment(s)",
+                 recorder->segment_index, format_name);
+        } else {
+            LOGI("Recording complete to %s file: %s", format_name,
+                                                      recorder->filename);
+        }
     } else {
         LOGE("Recording failed to %s", recorder->filename);
     }
@@ -752,13 +967,32 @@ bool
 sc_recorder_init(struct sc_recorder *recorder, const char *filename,
                  enum sc_record_format format, bool video, bool audio,
                  enum sc_orientation orientation,
+                 sc_tick split_time, size_t split_size,
                  const struct sc_recorder_callbacks *cbs, void *cbs_userdata) {
     assert(!sc_orientation_is_mirror(orientation));
 
-    recorder->filename = strdup(filename);
-    if (!recorder->filename) {
-        LOG_OOM();
-        return false;
+    bool splitting = split_time > 0 || split_size > 0;
+
+    if (splitting) {
+        recorder->filename_template = strdup(filename);
+        if (!recorder->filename_template) {
+            LOG_OOM();
+            return false;
+        }
+        recorder->segment_index = 1;
+        recorder->filename = sc_recorder_gen_segment_filename(filename, 1);
+        if (!recorder->filename) {
+            free(recorder->filename_template);
+            return false;
+        }
+    } else {
+        recorder->filename_template = NULL;
+        recorder->segment_index = 0;
+        recorder->filename = strdup(filename);
+        if (!recorder->filename) {
+            LOG_OOM();
+            return false;
+        }
     }
 
     bool ok = sc_mutex_init(&recorder->mutex);
@@ -791,6 +1025,11 @@ sc_recorder_init(struct sc_recorder *recorder, const char *filename,
 
     recorder->format = format;
 
+    recorder->split_time = split_time;
+    recorder->split_size = split_size;
+    recorder->video_codecpar = NULL;
+    recorder->audio_codecpar = NULL;
+
     assert(cbs && cbs->on_ended);
     recorder->cbs = cbs;
     recorder->cbs_userdata = cbs_userdata;
@@ -822,6 +1061,7 @@ error_mutex_destroy:
     sc_mutex_destroy(&recorder->mutex);
 error_free_filename:
     free(recorder->filename);
+    free(recorder->filename_template);
 
     return false;
 }
@@ -856,4 +1096,11 @@ sc_recorder_destroy(struct sc_recorder *recorder) {
     sc_cond_destroy(&recorder->cond);
     sc_mutex_destroy(&recorder->mutex);
     free(recorder->filename);
+    free(recorder->filename_template);
+    if (recorder->video_codecpar) {
+        avcodec_parameters_free(&recorder->video_codecpar);
+    }
+    if (recorder->audio_codecpar) {
+        avcodec_parameters_free(&recorder->audio_codecpar);
+    }
 }

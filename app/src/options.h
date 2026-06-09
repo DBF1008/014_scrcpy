@@ -275,6 +275,8 @@ struct scrcpy_options {
     enum sc_orientation_lock capture_orientation_lock;
     enum sc_orientation display_orientation;
     enum sc_orientation record_orientation;
+    sc_tick record_split_time; // 0 = disabled
+    size_t record_split_size; // 0 = disabled
     enum sc_display_ime_policy display_ime_policy;
     enum sc_render_fit render_fit;
     int16_t window_x; // SC_WINDOW_POSITION_UNDEFINED for "auto"

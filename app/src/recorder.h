@@ -58,6 +58,16 @@ struct sc_recorder {
     struct sc_recorder_stream video_stream;
     struct sc_recorder_stream audio_stream;
 
+    // Segmented recording
+    sc_tick split_time;         // 0 = no time-based split
+    size_t split_size;          // 0 = no size-based split
+    unsigned segment_index;     // current segment number (1-based when splitting)
+    char *filename_template;    // original filename for generating segment names
+
+    // Saved codec params for re-creating streams in new segments
+    AVCodecParameters *video_codecpar;
+    AVCodecParameters *audio_codecpar;
+
     const struct sc_recorder_callbacks *cbs;
     void *cbs_userdata;
 };
@@ -71,6 +81,7 @@ bool
 sc_recorder_init(struct sc_recorder *recorder, const char *filename,
                  enum sc_record_format format, bool video, bool audio,
                  enum sc_orientation orientation,
+                 sc_tick split_time, size_t split_size,
                  const struct sc_recorder_callbacks *cbs, void *cbs_userdata);
 
 bool

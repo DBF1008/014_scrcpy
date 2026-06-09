@@ -109,6 +109,8 @@ enum {
     OPT_KEEP_ACTIVE,
     OPT_BACKGROUND_COLOR,
     OPT_RENDER_FIT,
+    OPT_RECORD_SPLIT_TIME,
+    OPT_RECORD_SPLIT_SIZE,
 };
 
 struct sc_option {
@@ -793,6 +795,24 @@ static const struct sc_option options[] = {
                 "Possible values are 0, 90, 180 and 270. The number represents "
                 "the clockwise rotation in degrees.\n"
                 "Default is 0.",
+    },
+    {
+        .longopt_id = OPT_RECORD_SPLIT_TIME,
+        .longopt = "record-split-time",
+        .argdesc = "seconds",
+        .text = "Split recording into segments of the given duration (in "
+                "seconds).\n"
+                "The segments are named as file-001.mp4, file-002.mp4, etc.\n"
+                "Splits occur at video keyframe boundaries.",
+    },
+    {
+        .longopt_id = OPT_RECORD_SPLIT_SIZE,
+        .longopt = "record-split-size",
+        .argdesc = "size",
+        .text = "Split recording into segments when the file size reaches "
+                "the given limit.\n"
+                "Supports K (x1000) and M (x1000000) suffixes, e.g. 100M.\n"
+                "Splits occur at video keyframe boundaries.",
     },
     {
         .longopt_id = OPT_RENDER_DRIVER,
@@ -2656,6 +2676,32 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
                     return false;
                 }
                 break;
+            case OPT_RECORD_SPLIT_TIME: {
+                long value;
+                if (!sc_str_parse_integer(optarg, &value)) {
+                    LOGE("Could not parse record-split-time: %s", optarg);
+                    return false;
+                }
+                if (value < 1) {
+                    LOGE("Record split time must be at least 1 second");
+                    return false;
+                }
+                opts->record_split_time = SC_TICK_FROM_SEC(value);
+                break;
+            }
+            case OPT_RECORD_SPLIT_SIZE: {
+                long value;
+                if (!sc_str_parse_integer_with_suffix(optarg, &value)) {
+                    LOGE("Could not parse record-split-size: %s", optarg);
+                    return false;
+                }
+                if (value < 1000) {
+                    LOGE("Record split size must be at least 1K");
+                    return false;
+                }
+                opts->record_split_size = (size_t) value;
+                break;
+            }
             case OPT_ORIENTATION: {
                 enum sc_orientation orientation;
                 if (!parse_orientation(optarg, &orientation)) {
@@ -3301,6 +3347,12 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
         return false;
     }
 
+    if ((opts->record_split_time || opts->record_split_size)
+            && !opts->record_filename) {
+        LOGE("Record split specified without recording");
+        return false;
+    }
+
     if (opts->record_filename) {
         if (!opts->video && !opts->audio) {
             LOGE("Video and audio disabled, nothing to record");
@@ -3329,6 +3381,13 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
         if (opts->video
                 && sc_record_format_is_audio_only(opts->record_format)) {
             LOGE("Audio container does not support video stream");
+            return false;
+        }
+
+        if ((opts->record_split_time || opts->record_split_size)
+                && !opts->video) {
+            LOGE("Record splitting requires video "
+                 "(splits at video keyframe boundaries)");
             return false;
         }
 
