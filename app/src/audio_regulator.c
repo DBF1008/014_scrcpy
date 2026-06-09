@@ -159,7 +159,9 @@ sc_audio_regulator_push(struct sc_audio_regulator *ar, const AVFrame *frame) {
 
         // Reset state
         ar->avg_buffering.avg = ar->target_buffering;
-        int ret = swr_set_compensation(swr_ctx, 0, 0);
+        // compensation_distance must be non-zero, otherwise FFmpeg skips
+        // the dst_incr reset and the old compensation keeps running
+        int ret = swr_set_compensation(swr_ctx, 0, 1);
         (void) ret;
         assert(!ret); // disabling compensation should never fail
         ar->compensation_active = false;
@@ -289,23 +291,25 @@ sc_audio_regulator_push(struct sc_audio_regulator *ar, const AVFrame *frame) {
         return true;
     }
 
-    // Number of samples added (or removed, if negative) for compensation
-    int32_t instant_compensation = (int32_t) written - input_samples;
-    // Inserting silence instantly increases buffering
     int32_t inserted_silence = (int32_t) underflow;
-    // Dropping input samples instantly decreases buffering
-    int32_t dropped = (int32_t) skipped_samples;
 
-    // The compensation must apply instantly, it must not be smoothed
-    ar->avg_buffering.avg += instant_compensation + inserted_silence - dropped;
+    // Re-measure buffering after all buffer operations (writes, drops, and
+    // max_buffered_samples trimming) to get an accurate snapshot.
+    can_read = sc_audiobuf_can_read(&ar->buf);
+
+    // Inserting silence on underflow is not reflected in the audio buffer
+    // (it was sent directly to output), so it must be applied instantly.
+    //
+    // Compensation and drops ARE already reflected in can_read and will be
+    // naturally smoothed by sc_average_push(). Adding them as an instant
+    // adjustment would double-count them: once via the direct addition
+    // (retained at 127/128 per push) and again via can_read (at 1/128 per
+    // push), causing avg_buffering to drift from the true buffer level by
+    // ~127 * compensation_per_frame. Over long sessions this drift
+    // destabilizes the feedback loop, producing oscillating over/under-
+    // compensation that manifests as intermittent stutter and pops.
+    ar->avg_buffering.avg += inserted_silence;
     if (ar->avg_buffering.avg < 0) {
-        // Since dropping samples instantly reduces buffering, the difference
-        // is applied immediately to the average value, assuming that the delay
-        // between the producer and the consumer will be caught up.
-        //
-        // However, when this assumption is not valid, the average buffering
-        // may decrease indefinitely. Prevent it to become negative to limit
-        // the consequences.
         ar->avg_buffering.avg = 0;
     }
 
@@ -317,7 +321,7 @@ sc_audio_regulator_push(struct sc_audio_regulator *ar, const AVFrame *frame) {
          can_read, sc_average_get(&ar->avg_buffering));
 #endif
 
-    ar->samples_since_resync += written;
+    ar->samples_since_resync += samples;
     if (ar->samples_since_resync >= ar->sample_rate) {
         // Recompute compensation every second
         ar->samples_since_resync = 0;
