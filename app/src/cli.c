@@ -1753,6 +1753,44 @@ parse_capture_orientation(const char *s, enum sc_orientation *orientation,
 }
 
 static bool
+sc_validate_orientations(struct scrcpy_options *opts) {
+    // Auto-sync: if display orientation was set but record was not,
+    // use the rotation part of display orientation for recording
+    if (opts->display_orientation_set && !opts->record_orientation_set
+            && opts->display_orientation != SC_ORIENTATION_0) {
+        opts->record_orientation =
+            sc_orientation_get_rotation(opts->display_orientation);
+        LOGI("Record orientation automatically set to %s "
+             "(matching display orientation)",
+             sc_orientation_get_name(opts->record_orientation));
+    }
+
+    // Record orientation only supports rotation (FFmpeg display matrix
+    // limitation), reject any mirror/flip values
+    if (sc_orientation_is_mirror(opts->record_orientation)) {
+        LOGE("Record orientation only supports rotation, not flipping: %s",
+             sc_orientation_get_name(opts->record_orientation));
+        return false;
+    }
+
+    // Warn if capture and record orientations will stack
+    if (opts->capture_orientation != SC_ORIENTATION_0
+            && opts->record_orientation != SC_ORIENTATION_0) {
+        unsigned capture_rot = sc_orientation_get_rotation(
+            opts->capture_orientation);
+        unsigned record_rot = opts->record_orientation; // already pure rotation
+        unsigned total = ((capture_rot + record_rot) % 4) * 90;
+        LOGW("Capture orientation %s and record orientation %s will stack: "
+             "the recorded video will appear rotated by %u degrees",
+             sc_orientation_get_name(opts->capture_orientation),
+             sc_orientation_get_name(opts->record_orientation),
+             total);
+    }
+
+    return true;
+}
+
+static bool
 parse_window_position(const char *s, int16_t *position) {
     // special value for "auto"
     static_assert(SC_WINDOW_POSITION_UNDEFINED == -0x8000, "unexpected value");
@@ -2650,11 +2688,13 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
                 if (!parse_orientation(optarg, &opts->display_orientation)) {
                     return false;
                 }
+                opts->display_orientation_set = true;
                 break;
             case OPT_RECORD_ORIENTATION:
                 if (!parse_orientation(optarg, &opts->record_orientation)) {
                     return false;
                 }
+                opts->record_orientation_set = true;
                 break;
             case OPT_ORIENTATION: {
                 enum sc_orientation orientation;
@@ -2662,7 +2702,19 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
                     return false;
                 }
                 opts->display_orientation = orientation;
-                opts->record_orientation = orientation;
+                opts->display_orientation_set = true;
+                if (sc_orientation_is_mirror(orientation)) {
+                    // Record orientation only supports rotation, not
+                    // flipping; extract the rotation part for record
+                    opts->record_orientation =
+                        sc_orientation_get_rotation(orientation);
+                    LOGI("--orientation flip applied to display only; "
+                         "record orientation set to %s (rotation only)",
+                         sc_orientation_get_name(opts->record_orientation));
+                } else {
+                    opts->record_orientation = orientation;
+                }
+                opts->record_orientation_set = true;
                 break;
             }
             case OPT_RENDER_DRIVER:
@@ -3317,13 +3369,8 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
             }
         }
 
-        if (opts->record_orientation != SC_ORIENTATION_0) {
-            if (sc_orientation_is_mirror(opts->record_orientation)) {
-                LOGE("Record orientation only supports rotation, not "
-                     "flipping: %s",
-                     sc_orientation_get_name(opts->record_orientation));
-                return false;
-            }
+        if (!sc_validate_orientations(opts)) {
+            return false;
         }
 
         if (opts->video

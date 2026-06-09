@@ -275,6 +275,8 @@ struct scrcpy_options {
     enum sc_orientation_lock capture_orientation_lock;
     enum sc_orientation display_orientation;
     enum sc_orientation record_orientation;
+    bool display_orientation_set; // explicitly set by user
+    bool record_orientation_set;  // explicitly set by user
     enum sc_display_ime_policy display_ime_policy;
     enum sc_render_fit render_fit;
     int16_t window_x; // SC_WINDOW_POSITION_UNDEFINED for "auto"
